@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import json
 import subprocess
 from typing import Any
@@ -31,11 +32,14 @@ from app.services.mock_data import build_fallback_candles
 
 _CACHE: dict[str, tuple[float, Any]] = {}
 _CACHE_LOCK: Lock = Lock()
+_REFRESHING: set[str] = set()
+_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 # Default time‑to‑live values in seconds for various data types.  Adjust
 # accordingly if requirements change.
-CANDLE_TTL: float = 5.0
-SNAPSHOT_TTL: float = 1.0
+CANDLE_TTL: float = 1.0
+SNAPSHOT_TTL: float = 0.5
+INSTRUMENTS_TTL: float = 180.0
 
 
 def get_cache(key: str, ttl: float) -> Any | None:
@@ -48,15 +52,37 @@ def get_cache(key: str, ttl: float) -> Any | None:
             # if entry is still fresh return it
             if now - ts < ttl:
                 return data
-            # otherwise remove expired entry
-            _CACHE.pop(key, None)
     return None
+
+
+def get_stale_cache(key: str) -> Any | None:
+    """Return the last cached value even when it is past its live TTL."""
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        return entry[1] if entry else None
 
 
 def set_cache(key: str, data: Any) -> None:
     """Store data in the cache with the current timestamp."""
     with _CACHE_LOCK:
         _CACHE[key] = (time.time(), data)
+
+
+def refresh_cache_async(key: str, refresh: Any) -> None:
+    """Run one background refresh for a cache key while serving stale data."""
+    with _CACHE_LOCK:
+        if key in _REFRESHING:
+            return
+        _REFRESHING.add(key)
+
+    def _run() -> None:
+        try:
+            refresh()
+        finally:
+            with _CACHE_LOCK:
+                _REFRESHING.discard(key)
+
+    _REFRESH_EXECUTOR.submit(_run)
 
 
 @dataclass
@@ -96,28 +122,28 @@ def _coerce_envelope(payload: Any) -> Any:
     return payload
 
 
-def fetch_upstream(path: str, params: dict[str, Any] | None = None) -> UpstreamResult:
+def fetch_upstream(path: str, params: dict[str, Any] | None = None, timeout: float | None = None) -> UpstreamResult:
     query = urlencode({key: value for key, value in (params or {}).items() if value not in (None, "")})
     url = f"{settings.upstream_base_url}{path}"
     if query:
         url = f"{url}?{query}"
 
     try:
-        with urlopen(url, timeout=settings.upstream_timeout_seconds) as response:
+        with urlopen(url, timeout=timeout or settings.upstream_timeout_seconds) as response:
             payload = json.loads(response.read().decode("utf-8"))
         return UpstreamResult(connected=True, source="upstream", data=_coerce_envelope(payload))
     except Exception as exc:  # pragma: no cover - network path depends on local environment
         return UpstreamResult(connected=False, source="fallback", data=None, error=str(exc))
 
 
-def fetch_okx_public(path: str, params: dict[str, Any] | None = None) -> UpstreamResult:
+def fetch_okx_public(path: str, params: dict[str, Any] | None = None, timeout: float | None = None) -> UpstreamResult:
     query = urlencode({key: value for key, value in (params or {}).items() if value not in (None, "")})
     url = f"{settings.okx_public_base_url}{path}"
     if query:
         url = f"{url}?{query}"
 
     try:
-        with urlopen(url, timeout=settings.upstream_timeout_seconds) as response:
+        with urlopen(url, timeout=timeout or settings.upstream_timeout_seconds) as response:
             payload = json.loads(response.read().decode("utf-8"))
         data = payload.get("data") if isinstance(payload, dict) else payload
         return UpstreamResult(connected=True, source="okx-public", data=data)
@@ -172,6 +198,7 @@ def normalize_candles(payload: Any, instrument_id: str, timeframe: str, limit: i
         normalized = build_fallback_candles(limit)
         source = "fallback"
     else:
+        normalized.sort(key=lambda item: item["ts"])
         source = "upstream"
 
     return {
@@ -182,7 +209,37 @@ def normalize_candles(payload: Any, instrument_id: str, timeframe: str, limit: i
     }
 
 
-def fetch_bar_series(instrument_id: str, timeframe: str, limit: int = 160) -> dict[str, Any]:
+def sync_latest_candle_with_ticker(payload: dict[str, Any], instrument_id: str) -> dict[str, Any]:
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        return payload
+    ticker_result = fetch_okx_public("/api/v5/market/ticker", {"instId": instrument_id}, timeout=1.5)
+    if not ticker_result.connected:
+        ticker_result = fetch_okx_cli(["market", "ticker", instrument_id])
+    row = ticker_result.data[0] if ticker_result.connected and isinstance(ticker_result.data, list) and ticker_result.data else None
+    if not row:
+        return payload
+    try:
+        last_price = float(row.get("last") or 0)
+        if last_price <= 0:
+            return payload
+        latest = dict(items[-1])
+        latest["close"] = last_price
+        latest["high"] = max(float(latest.get("high") or last_price), last_price)
+        latest["low"] = min(float(latest.get("low") or last_price), last_price)
+        payload["items"] = [*items[:-1], latest]
+        payload["tickerSynced"] = True
+    except (TypeError, ValueError):
+        return payload
+    return payload
+
+
+def fetch_bar_series(
+    instrument_id: str,
+    timeframe: str,
+    limit: int = 160,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     """
     Fetch a bar series for the given instrument and timeframe.
 
@@ -196,11 +253,38 @@ def fetch_bar_series(instrument_id: str, timeframe: str, limit: int = 160) -> di
     instrument_id = normalize_inst_id(instrument_id)
     # check cache
     cache_key = f"candles:{instrument_id}:{timeframe}:{limit}"
-    cached = get_cache(cache_key, CANDLE_TTL)
-    if cached is not None:
-        return cached
+    if not force_refresh:
+        cached = get_cache(cache_key, CANDLE_TTL)
+        if cached is not None:
+            return cached
+        stale = get_stale_cache(cache_key)
+        if stale is not None:
+            refresh_cache_async(
+                cache_key,
+                lambda: fetch_bar_series(instrument_id, timeframe, limit, force_refresh=True),
+            )
+            return stale
 
-    # Attempt to fetch from OKX CLI (highest priority)
+    # Public market data needs to feel live; OKX REST is usually much faster
+    # than spawning the CLI process for every poll. Account and order execution
+    # paths still use the CLI where credentials and safety controls matter.
+    okx_result = fetch_okx_public(
+        "/api/v5/market/candles",
+        {
+            "instId": instrument_id,
+            "bar": timeframe,
+            "limit": limit,
+        },
+        timeout=2.0,
+    )
+    if okx_result.connected:
+        payload = normalize_candles(okx_result.data, instrument_id, timeframe, limit)
+        payload["source"] = "okx-public"
+        payload = sync_latest_candle_with_ticker(payload, instrument_id)
+        set_cache(cache_key, payload)
+        return payload
+
+    # Fallback to the official CLI if the public REST path is unavailable.
     okx_result = fetch_okx_cli([
         "market",
         "candles",
@@ -213,21 +297,7 @@ def fetch_bar_series(instrument_id: str, timeframe: str, limit: int = 160) -> di
     if okx_result.connected:
         payload = normalize_candles(okx_result.data, instrument_id, timeframe, limit)
         payload["source"] = "okx-cli"
-        set_cache(cache_key, payload)
-        return payload
-
-    # Next try the OKX public REST API
-    okx_result = fetch_okx_public(
-        "/api/v5/market/candles",
-        {
-            "instId": instrument_id,
-            "bar": timeframe,
-            "limit": limit,
-        },
-    )
-    if okx_result.connected:
-        payload = normalize_candles(okx_result.data, instrument_id, timeframe, limit)
-        payload["source"] = "okx-public"
+        payload = sync_latest_candle_with_ticker(payload, instrument_id)
         set_cache(cache_key, payload)
         return payload
 
@@ -243,6 +313,7 @@ def fetch_bar_series(instrument_id: str, timeframe: str, limit: int = 160) -> di
     if upstream_result.connected:
         payload = normalize_candles(upstream_result.data, instrument_id, timeframe, limit)
         payload["source"] = "upstream"
+        payload = sync_latest_candle_with_ticker(payload, instrument_id)
         set_cache(cache_key, payload)
         return payload
 
@@ -256,10 +327,10 @@ def fetch_bar_series(instrument_id: str, timeframe: str, limit: int = 160) -> di
     return payload
 
 
-def fetch_view(view_name: str, **params: Any) -> UpstreamResult:
+def fetch_view(view_name: str, timeout: float | None = None, **params: Any) -> UpstreamResult:
     query = {"view_name": view_name}
     query.update(params)
-    return fetch_upstream("/platform/views/query", query)
+    return fetch_upstream("/platform/views/query", query, timeout=timeout)
 
 
 def fetch_paper_strategies(limit: int = 8) -> UpstreamResult:
@@ -285,43 +356,114 @@ def _normalize_okx_change_pct(row: dict[str, Any]) -> float:
         return 0.0
 
 
-def fetch_okx_market_snapshot(inst_id: str = "BTC-USDT", watchlist: list[str] | None = None) -> dict[str, Any]:
+def _okx_inst_type(symbol: str) -> str:
+    return "SWAP" if normalize_inst_id(symbol).endswith("-SWAP") else "SPOT"
+
+
+def _fetch_okx_tickers_by_type(inst_types: set[str]) -> tuple[str, dict[str, dict[str, Any]]]:
+    rows_by_symbol: dict[str, dict[str, Any]] = {}
+    source = "fallback"
+    for inst_type in sorted(inst_types):
+        result = fetch_okx_public("/api/v5/market/tickers", {"instType": inst_type}, timeout=1.5)
+        if not result.connected:
+            continue
+        source = result.source
+        for row in result.data if isinstance(result.data, list) else []:
+            inst_id = str(row.get("instId") or "").upper()
+            if inst_id:
+                rows_by_symbol[inst_id] = row
+    return source, rows_by_symbol
+
+
+def _fetch_okx_ticker(symbol: str) -> UpstreamResult:
+    result = fetch_okx_public("/api/v5/market/ticker", {"instId": symbol}, timeout=1.5)
+    if result.connected:
+        return result
+    return fetch_okx_cli(["market", "ticker", symbol])
+
+
+def _fetch_okx_orderbook(symbol: str) -> UpstreamResult:
+    result = fetch_okx_public("/api/v5/market/books", {"instId": symbol, "sz": 5}, timeout=1.5)
+    if result.connected:
+        return result
+    return fetch_okx_cli(["market", "orderbook", symbol, "--sz", "5"])
+
+
+def fetch_okx_market_snapshot(
+    inst_id: str = "BTC-USDT",
+    watchlist: list[str] | None = None,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     inst_id = normalize_inst_id(inst_id)
     # use a combined cache key for the full snapshot.  Because the snapshot
     # aggregates ticker, orderbook and watchlist, caching at this level
     # prevents multiple downstream calls during rapid polling.
     cache_key = f"market_snapshot:{inst_id}:{','.join(watchlist or []) if watchlist else ''}"
-    cached = get_cache(cache_key, SNAPSHOT_TTL)
-    if cached is not None:
-        return cached
-
-    # Fetch ticker and orderbook from the CLI first, fallback to public REST
-    ticker_result = fetch_okx_cli(["market", "ticker", inst_id])
-    books_result = fetch_okx_cli(["market", "orderbook", inst_id, "--sz", "5"])
-    if not ticker_result.connected:
-        ticker_result = fetch_okx_public("/api/v5/market/ticker", {"instId": inst_id})
-    if not books_result.connected:
-        books_result = fetch_okx_public("/api/v5/market/books", {"instId": inst_id, "sz": 5})
+    if not force_refresh:
+        cached = get_cache(cache_key, SNAPSHOT_TTL)
+        if cached is not None:
+            return cached
+        stale = get_stale_cache(cache_key)
+        if stale is not None:
+            refresh_cache_async(
+                cache_key,
+                lambda: fetch_okx_market_snapshot(inst_id, watchlist, force_refresh=True),
+            )
+            return stale
 
     symbols = [normalize_inst_id(symbol) for symbol in (watchlist or ["BTC-USDT", "ETH-USDT", "SOL-USDT", "DOGE-USDT"])]
+    query_symbols = symbols if inst_id in symbols else [inst_id, *symbols]
+
+    ticker_source, tickers_by_symbol = _fetch_okx_tickers_by_type({_okx_inst_type(symbol) for symbol in query_symbols})
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        ticker_future = executor.submit(_fetch_okx_ticker, inst_id) if inst_id not in tickers_by_symbol else None
+        books_future = executor.submit(_fetch_okx_orderbook, inst_id)
+        ticker_result = ticker_future.result() if ticker_future else UpstreamResult(
+            connected=True,
+            source=ticker_source,
+            data=[tickers_by_symbol[inst_id]],
+        )
+        books_result = books_future.result()
+
+    if ticker_result.connected and isinstance(ticker_result.data, list) and ticker_result.data:
+        tickers_by_symbol[inst_id] = ticker_result.data[0]
+
     watch_rows: list[dict[str, Any]] = []
     for symbol in symbols:
-        row_result = fetch_okx_cli(["market", "ticker", symbol])
-        if not row_result.connected:
-            row_result = fetch_okx_public("/api/v5/market/ticker", {"instId": symbol})
-        row = row_result.data[0] if row_result.connected and isinstance(row_result.data, list) and row_result.data else None
-        if row:
-            change_pct = _normalize_okx_change_pct(row)
+        row = tickers_by_symbol.get(symbol)
+        if row is None:
+            row_result = _fetch_okx_ticker(symbol)
+            row = row_result.data[0] if row_result.connected and isinstance(row_result.data, list) and row_result.data else None
+        if not row:
             watch_rows.append(
                 {
                     "symbol": symbol.replace("-", "/"),
-                    "price": f"{float(row.get('last') or 0):,.4f}".rstrip("0").rstrip("."),
-                    "change": f"{change_pct:+.2f}%",
-                    "signal": "实时行情",
+                    "price": "--",
+                    "change": "--",
+                    "high24h": "--",
+                    "low24h": "--",
+                    "volume24h": "--",
+                    "signal": "等待行情",
                 }
             )
+            continue
+        change_pct = _normalize_okx_change_pct(row)
+        high_24h = float(row.get("high24h") or 0)
+        low_24h = float(row.get("low24h") or 0)
+        volume_24h = float(row.get("volCcy24h") or row.get("vol24h") or 0)
+        watch_rows.append(
+            {
+                "symbol": symbol.replace("-", "/"),
+                "price": f"{float(row.get('last') or 0):,.4f}".rstrip("0").rstrip("."),
+                "change": f"{change_pct:+.2f}%",
+                "high24h": f"{high_24h:,.4f}".rstrip("0").rstrip("."),
+                "low24h": f"{low_24h:,.4f}".rstrip("0").rstrip("."),
+                "volume24h": f"{volume_24h:,.0f}",
+                "signal": "实时行情",
+            }
+        )
 
-    ticker = ticker_result.data[0] if ticker_result.connected and isinstance(ticker_result.data, list) and ticker_result.data else None
+    ticker = tickers_by_symbol.get(inst_id)
     books = books_result.data[0] if books_result.connected and isinstance(books_result.data, list) and books_result.data else None
 
     if not ticker and not books and not watch_rows:
@@ -378,3 +520,57 @@ def fetch_okx_market_snapshot(inst_id: str = "BTC-USDT", watchlist: list[str] | 
     }
     set_cache(cache_key, result)
     return result
+
+
+def fetch_okx_instruments(query: str = "", limit: int = 80) -> dict[str, Any]:
+    normalized_query = query.strip().upper()
+    cache_key = "okx_instruments:spot_swap"
+    cached = get_cache(cache_key, INSTRUMENTS_TTL)
+    if cached is None:
+        items: list[dict[str, str]] = []
+        source = "fallback"
+        connected = False
+        for inst_type, label in (("SPOT", "现货"), ("SWAP", "永续")):
+            result = fetch_okx_cli(["market", "instruments", "--instType", inst_type])
+            if not result.connected:
+                result = fetch_okx_public("/api/v5/public/instruments", {"instType": inst_type})
+            if result.connected and isinstance(result.data, list):
+                connected = True
+                source = result.source
+                for row in result.data:
+                    inst_id = str(row.get("instId") or "").upper()
+                    base_ccy = str(row.get("baseCcy") or row.get("uly") or inst_id.split("-")[0]).upper()
+                    quote_ccy = str(row.get("quoteCcy") or "USDT").upper()
+                    if not inst_id or "USDT" not in inst_id:
+                        continue
+                    items.append(
+                        {
+                            "symbol": inst_id,
+                            "base": base_ccy,
+                            "quote": quote_ccy,
+                            "marketType": inst_type,
+                            "marketLabel": label,
+                            "label": f"{inst_id} · {label}",
+                        }
+                    )
+        cached = {"source": source, "connected": connected, "items": items}
+        if connected:
+            set_cache(cache_key, cached)
+
+    items = list(cached["items"])
+    if normalized_query:
+        starts = [
+            item for item in items
+            if item["base"].startswith(normalized_query) or item["symbol"].startswith(normalized_query)
+        ]
+        contains = [
+            item for item in items
+            if item not in starts and normalized_query in item["symbol"]
+        ]
+        items = starts + contains
+
+    return {
+        "source": cached["source"],
+        "connected": cached["connected"],
+        "items": items[:limit],
+    }

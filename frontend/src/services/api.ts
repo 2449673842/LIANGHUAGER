@@ -1,7 +1,18 @@
 import axios from 'axios'
 
+function resolveApiBaseUrl() {
+  const configured = import.meta.env.VITE_API_BASE_URL
+  if (configured) return configured
+  if (typeof window === 'undefined') return 'http://127.0.0.1:8100/api'
+  const host = window.location.hostname
+  if (!host || host === 'localhost' || host === '127.0.0.1') {
+    return 'http://127.0.0.1:8100/api'
+  }
+  return `${window.location.protocol}//${host}:8100/api`
+}
+
 const client = axios.create({
-  baseURL: '/api',
+  baseURL: resolveApiBaseUrl(),
   timeout: 5000,
 })
 
@@ -15,7 +26,15 @@ export type OverviewPayload = {
   source?: string
   upstreamConnected?: boolean
   marketPulse: Array<{ label: string; value: string; tone?: 'up' | 'down' | 'neutral' }>
-  watchlist: Array<{ symbol: string; price: string; change: string; signal: string }>
+  watchlist: Array<{
+    symbol: string
+    price: string
+    change: string
+    signal: string
+    high24h?: string
+    low24h?: string
+    volume24h?: string
+  }>
   positions: Array<{ strategy: string; symbol: string; side: string; pnl: string; size: string }>
   activity: Array<{ time: string; message: string; tone?: 'up' | 'down' | 'neutral' }>
   orderbook: {
@@ -85,52 +104,47 @@ export type CandlePayload = {
   items: CandlePoint[]
 }
 
+export type InstrumentOption = {
+  symbol: string
+  base: string
+  quote: string
+  marketType: string
+  marketLabel: string
+  label: string
+}
+
+export type InstrumentPayload = {
+  source?: string
+  connected?: boolean
+  items: InstrumentOption[]
+}
+
+export type AiSettingsPayload = {
+  enabled: boolean
+  provider: string
+  baseUrl: string
+  model: string
+  hasApiKey: boolean
+  timeoutSeconds: number
+}
+
 const overviewFallback: OverviewPayload = {
-  marketPulse: [
-    { label: 'BTC/USDT', value: '103,842.8', tone: 'up' },
-    { label: '24h 变化', value: '+2.41%', tone: 'up' },
-    { label: '活跃策略', value: '12', tone: 'neutral' },
-    { label: '实时告警', value: '3', tone: 'down' },
-  ],
-  watchlist: [
-    { symbol: 'BTC/USDT', price: '103,842.8', change: '+2.41%', signal: '趋势延续' },
-    { symbol: 'ETH/USDT', price: '4,978.2', change: '+1.34%', signal: '突破回踩' },
-    { symbol: 'SOL/USDT', price: '238.7', change: '-0.84%', signal: '观望' },
-    { symbol: 'DOGE/USDT', price: '0.2281', change: '+4.92%', signal: '量价共振' },
-  ],
-  positions: [
-    { strategy: '趋势跟随-A', symbol: 'BTC/USDT', side: '做多', pnl: '+842.40', size: '0.75 BTC' },
-    { strategy: '突破回踩-B', symbol: 'ETH/USDT', side: '做多', pnl: '+192.60', size: '8 ETH' },
-    { strategy: '均值回归-C', symbol: 'SOL/USDT', side: '做空', pnl: '-54.22', size: '320 SOL' },
-  ],
-  activity: [
-    { time: '09:42:18', message: 'BTC/USDT 触发 15m 做多加仓信号', tone: 'up' },
-    { time: '09:37:06', message: 'ETH/USDT 实盘策略进入人工确认队列', tone: 'neutral' },
-    { time: '09:32:44', message: 'SOL/USDT 触发保护止损', tone: 'down' },
-    { time: '09:29:11', message: '邮件告警发送成功: trend-follow-btc', tone: 'neutral' },
-  ],
+  source: 'offline',
+  upstreamConnected: false,
+  marketPulse: [],
+  watchlist: [],
+  positions: [],
+  activity: [],
   orderbook: {
-    asks: [
-      ['103845.2', '12.84'],
-      ['103844.6', '9.22'],
-      ['103844.1', '5.90'],
-      ['103843.7', '4.11'],
-      ['103843.2', '2.34'],
-    ],
-    bids: [
-      ['103842.5', '10.71'],
-      ['103842.0', '8.19'],
-      ['103841.4', '7.88'],
-      ['103840.9', '4.70'],
-      ['103840.4', '3.16'],
-    ],
-    spreadText: '2.7 (0.003%)',
+    asks: [],
+    bids: [],
+    spreadText: '--',
   },
   controlState: {
-    running: true,
-    cooldownSeconds: 124,
-    executionMode: '人工确认',
-    lastSync: '2026-05-16 09:42:24',
+    running: false,
+    cooldownSeconds: 0,
+    executionMode: '未连接',
+    lastSync: '--',
   },
 }
 
@@ -213,6 +227,12 @@ const candleFallback: CandlePayload = {
   items: buildFallbackCandles(),
 }
 
+const instrumentFallback: InstrumentPayload = {
+  source: 'offline',
+  connected: false,
+  items: [],
+}
+
 const strategyBoardFallback: StrategyBoardPayload = {
   source: 'fallback',
   upstreamConnected: false,
@@ -274,11 +294,14 @@ async function withFallback<T>(path: string, fallback: T): Promise<T> {
   }
 }
 
-export const getOverview = () => withFallback('/workbench/overview', overviewFallback)
+export const getOverview = (instrumentId = 'BTC-USDT') =>
+  withFallback(`/workbench/overview?instrument_id=${instrumentId}`, overviewFallback)
 export const getExecution = () => withFallback('/execution/state', executionFallback)
 export const getBacktestWorkbench = () => withFallback('/backtests/workbench', backtestFallback)
 export const getMarketCandles = (instrumentId = 'BTC-USDT', timeframe = '15m', limit = 160) =>
   withFallback(`/market/candles?instrument_id=${instrumentId}&timeframe=${timeframe}&limit=${limit}`, candleFallback)
+export const getMarketInstruments = (query = '', limit = 800) =>
+  withFallback(`/market/instruments?q=${encodeURIComponent(query)}&limit=${limit}`, instrumentFallback)
 export const getStrategyBoard = (limit = 12) => withFallback(`/strategies/board?limit=${limit}`, strategyBoardFallback)
 
 // -------------------------
@@ -356,8 +379,150 @@ export async function runBacktest(params: { period: string; [key: string]: any }
   return response.data.data
 }
 
-/** Import a new strategy.  Accepts a query object with at least a `label` field. */
-export async function importStrategy(params: { [key: string]: any }): Promise<Array<{ strategyId: string; versionId: string; label: string; instrumentId: string; timeframe: string; status: string; updatedAt: string }>> {
-  const response = await client.post<ApiEnvelope<Array<{ strategyId: string; versionId: string; label: string; instrumentId: string; timeframe: string; status: string; updatedAt: string }>>>('/strategies/import', null, { params })
+/** Import a new strategy.  Sends JSON body with strategy fields. */
+export async function importStrategy(payload: { label?: string; instrumentId?: string; timeframe?: string; code?: string; strategyId?: string }): Promise<Array<{ strategyId: string; versionId: string; label: string; instrumentId: string; timeframe: string; status: string; updatedAt: string }>> {
+  const response = await client.post<ApiEnvelope<Array<{ strategyId: string; versionId: string; label: string; instrumentId: string; timeframe: string; status: string; updatedAt: string }>>>('/strategies/import', payload)
+  return response.data.data
+}
+
+// -----------------------------------------------------------------------------
+// Execution management — queue confirmation, mode switching, retry
+
+export async function confirmExecutionQueue(id: number) {
+  const response = await client.post<ApiEnvelope<{ ok: boolean; result?: any; queues: any[] }>>(`/execution/queues/${id}/confirm`)
+  return response.data.data
+}
+
+export async function rejectExecutionQueue(id: number) {
+  const response = await client.post<ApiEnvelope<{ ok: boolean; queues: any[] }>>(`/execution/queues/${id}/reject`)
+  return response.data.data
+}
+
+export async function retryExecutionQueue(id: number) {
+  const response = await client.post<ApiEnvelope<{ ok: boolean; result?: any; queues: any[] }>>(`/execution/queues/${id}/retry`)
+  return response.data.data
+}
+
+export async function getExecutionMode() {
+  const response = await client.get<ApiEnvelope<{ mode: string }>>('/execution/mode')
+  return response.data.data
+}
+
+export async function setExecutionMode(mode: '人工确认' | '自动执行') {
+  const response = await client.post<ApiEnvelope<{ mode: string; ok?: boolean; message?: string }>>('/execution/mode', { mode })
+  return response.data.data
+}
+
+// -----------------------------------------------------------------------------
+// Backtest templates and archives
+
+export async function getBacktestTemplates() {
+  const response = await client.get<ApiEnvelope<any[]>>('/backtests/templates')
+  return response.data.data
+}
+
+export async function saveBacktestTemplate(template: { name: string; params: any }) {
+  const response = await client.post<ApiEnvelope<any[]>>('/backtests/templates', template)
+  return response.data.data
+}
+
+export async function getBacktestArchives() {
+  const response = await client.get<ApiEnvelope<any[]>>('/backtests/archives')
+  return response.data.data
+}
+
+export async function saveBacktestArchive(record: { name: string; params: any; result: any }) {
+  const response = await client.post<ApiEnvelope<any[]>>('/backtests/archives', record)
+  return response.data.data
+}
+
+// -----------------------------------------------------------------------------
+// Strategy code editor — get/save/check code, versions, templates, publish
+
+export type StrategyVersionItem = {
+  versionId: string
+  label: string
+  status: string
+  updatedAt: string
+  note?: string
+}
+
+export type StrategyTemplateItem = {
+  id: string
+  label: string
+  instrumentId: string
+  timeframe: string
+  code: string
+}
+
+export async function getStrategyCode(strategyId: string): Promise<{ strategyId: string; label?: string; code: string }> {
+  const response = await client.get<ApiEnvelope<{ strategyId: string; label?: string; code: string }>>(`/strategies/${strategyId}/code`)
+  return response.data.data
+}
+
+export async function saveStrategyCode(strategyId: string, code: string) {
+  const response = await client.put<ApiEnvelope<{ strategyId: string; label?: string; code: string; updatedAt: string }>>(`/strategies/${strategyId}/code`, { code })
+  return response.data.data
+}
+
+export async function checkStrategyCode(code: string): Promise<{ ok: boolean; errors: string[]; warnings: string[]; checkedAt: string }> {
+  const response = await client.post<ApiEnvelope<{ ok: boolean; errors: string[]; warnings: string[]; checkedAt: string }>>('/strategies/check', { code })
+  return response.data.data
+}
+
+export async function getStrategyVersions(strategyId: string): Promise<StrategyVersionItem[]> {
+  const response = await client.get<ApiEnvelope<StrategyVersionItem[]>>(`/strategies/${strategyId}/versions`)
+  return response.data.data
+}
+
+export async function saveStrategyVersion(strategyId: string, code: string, note?: string): Promise<StrategyVersionItem> {
+  const response = await client.post<ApiEnvelope<StrategyVersionItem>>(`/strategies/${strategyId}/versions`, { code, note })
+  return response.data.data
+}
+
+export async function publishStrategy(strategyId: string, versionId?: string) {
+  const response = await client.post<ApiEnvelope<{ strategy: StrategyBoardPayload['items'][number]; queue: any }>>('/strategies/publish', { strategyId, versionId })
+  return response.data.data
+}
+
+export async function getStrategyTemplates(): Promise<StrategyTemplateItem[]> {
+  const response = await client.get<ApiEnvelope<StrategyTemplateItem[]>>('/strategies/templates')
+  return response.data.data
+}
+
+export async function createStrategyFromTemplate(payload: { templateId?: string; label?: string; instrumentId?: string; timeframe?: string }) {
+  const response = await client.post<ApiEnvelope<StrategyBoardPayload['items']>>('/strategies/templates', payload)
+  return response.data.data
+}
+
+export async function saveStrategyTemplate(payload: { name: string; code?: string; instrumentId?: string; timeframe?: string }) {
+  const response = await client.post<ApiEnvelope<any[]>>('/strategies/templates/save', payload)
+  return response.data.data
+}
+
+export async function renameStrategyTemplate(templateId: string, newLabel: string) {
+  const response = await client.put<ApiEnvelope<any[]>>(`/strategies/templates/${encodeURIComponent(templateId)}`, { new_label: newLabel })
+  return response.data.data
+}
+
+export async function deleteStrategyTemplate(templateId: string) {
+  const response = await client.delete<ApiEnvelope<any[]>>(`/strategies/templates/${encodeURIComponent(templateId)}`)
+  return response.data.data
+}
+
+export async function getAiSettings(): Promise<AiSettingsPayload> {
+  const response = await client.get<ApiEnvelope<AiSettingsPayload>>('/settings/ai')
+  return response.data.data
+}
+
+export async function saveAiSettings(payload: {
+  enabled: boolean
+  provider: string
+  baseUrl: string
+  model: string
+  apiKey?: string
+  timeoutSeconds: number
+}): Promise<AiSettingsPayload> {
+  const response = await client.post<ApiEnvelope<AiSettingsPayload>>('/settings/ai', payload)
   return response.data.data
 }

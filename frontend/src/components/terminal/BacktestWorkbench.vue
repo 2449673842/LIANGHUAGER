@@ -33,17 +33,17 @@
     </div>
 
     <div class="stack">
-      <PanelCard title="回测参数" description="先接工作台右侧参数面板">
+      <PanelCard title="回测参数" description="修改参数后点击运行回测">
         <div class="field-grid">
           <div class="field">
             <label>回测周期</label>
-            <select>
-              <option v-for="period in payload.periods" :key="period">{{ period }}</option>
+            <select v-model="params.period">
+              <option v-for="p in payload.periods" :key="p" :value="p">{{ p }}</option>
             </select>
           </div>
           <div class="field">
             <label>交易方向</label>
-            <select>
+            <select v-model="params.direction">
               <option>做多</option>
               <option>做空</option>
               <option>双向</option>
@@ -51,19 +51,19 @@
           </div>
           <div class="field">
             <label>初始资金</label>
-            <input value="10000" />
+            <input v-model.number="params.capital" type="number" />
           </div>
           <div class="field">
             <label>杠杆</label>
-            <input value="1" />
+            <input v-model.number="params.leverage" type="number" />
           </div>
           <div class="field">
             <label>手续费 (%)</label>
-            <input value="0.0200" />
+            <input v-model.number="params.fee" type="number" step="0.0001" />
           </div>
           <div class="field">
             <label>滑点 (%)</label>
-            <input value="0.0200" />
+            <input v-model.number="params.slippage" type="number" step="0.0001" />
           </div>
         </div>
       </PanelCard>
@@ -81,15 +81,34 @@
 </template>
 
 <script setup lang="ts">
+import { reactive, watch } from 'vue'
 import PanelCard from '../cards/PanelCard.vue'
 import MarketKlineChart from './MarketKlineChart.vue'
 import EquityCurveChart from './EquityCurveChart.vue'
 import type { BacktestPayload, CandlePoint } from '../../services/api'
 
-defineProps<{
+const props = defineProps<{
   payload: BacktestPayload
   candles: CandlePoint[]
+  params?: Record<string, any>
 }>()
+
+const emit = defineEmits<{ 'update:params': [values: Record<string, any>] }>()
+
+const defaults = { period: '1M', direction: '做多', capital: 10000, leverage: 1, fee: 0.02, slippage: 0.02 }
+const params = reactive<Record<string, any>>({ ...defaults, ...(props.params || {}) })
+
+watch(() => props.params, (p) => {
+  if (p) Object.assign(params, p)
+}, { deep: true })
+
+watch(() => props.payload.periods, (periods) => {
+  if (periods && periods.length > 0 && !periods.includes(params.period)) {
+    params.period = periods[0]
+  }
+}, { immediate: true })
+
+watch(params, () => { emit('update:params', { ...params }) }, { deep: true, immediate: true })
 
 function toneClass(tone?: 'up' | 'down' | 'neutral') {
   if (tone === 'up') return 'tone-up'

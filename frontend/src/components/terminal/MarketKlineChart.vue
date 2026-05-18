@@ -138,7 +138,7 @@ const option = computed(() => {
 
 <style scoped>
 .chart-surface {
-  height: 360px;
+  height: 330px;
   width: 100%;
 }
 </style>

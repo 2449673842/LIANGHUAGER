@@ -2,7 +2,7 @@ from fastapi import APIRouter, Query
 
 from app.config import settings
 from app.schemas.common import ApiEnvelope
-from app.services.upstream import fetch_bar_series, fetch_okx_market_snapshot
+from app.services.upstream import fetch_bar_series, fetch_okx_instruments, fetch_okx_market_snapshot
 
 router = APIRouter(prefix="/api", tags=["market"])
 
@@ -21,3 +21,11 @@ def get_market_snapshot(
     instrument_id: str = Query(default=settings.default_instrument_id),
 ) -> ApiEnvelope[dict]:
     return ApiEnvelope(data=fetch_okx_market_snapshot(inst_id=instrument_id))
+
+
+@router.get("/market/instruments", response_model=ApiEnvelope[dict])
+def get_market_instruments(
+    q: str = Query(default=""),
+    limit: int = Query(default=800, ge=1, le=1200),
+) -> ApiEnvelope[dict]:
+    return ApiEnvelope(data=fetch_okx_instruments(query=q, limit=limit))

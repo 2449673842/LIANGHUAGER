@@ -10,6 +10,9 @@ __pycache__/
 frontend/.vite/
 frontend/dist/
 backend/app/**/__pycache__/
+backend/data/*.json
 DP/
 codex升级代码位置/
+cliproxy/
+portctl/
 frontend/src/**/*.js

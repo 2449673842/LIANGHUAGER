@@ -90,8 +90,21 @@ const searchState = reactive({
 })
 
 function onSearchInput(key: string, items: string[]) {
-  const q = (values[key] || '').toLowerCase()
-  searchState.filtered = items.filter(i => i.toLowerCase().includes(q))
+  const q = (values[key] || '').trim().toLowerCase()
+  const scored = items
+    .map((item) => {
+      const lower = item.toLowerCase()
+      const symbol = lower.split('·')[0].trim()
+      if (!q) return { item, score: 0 }
+      if (symbol.startsWith(q)) return { item, score: 0 }
+      if (lower.startsWith(q)) return { item, score: 1 }
+      if (symbol.includes(q)) return { item, score: 2 }
+      if (lower.includes(q)) return { item, score: 3 }
+      return { item, score: 99 }
+    })
+    .filter((entry) => entry.score < 99)
+    .sort((a, b) => a.score - b.score || a.item.localeCompare(b.item))
+  searchState.filtered = scored.map((entry) => entry.item).slice(0, 80)
   searchState.hoverIndex = 0
   searchState.visible = searchState.filtered.length > 0
   searchState.sourceKey = key
@@ -99,7 +112,7 @@ function onSearchInput(key: string, items: string[]) {
 
 function onSearchFocus(key: string, items: string[]) {
   if (!values[key]) {
-    searchState.filtered = items.slice()
+    searchState.filtered = items.slice(0, 80)
     searchState.hoverIndex = 0
     searchState.visible = true
     searchState.sourceKey = key

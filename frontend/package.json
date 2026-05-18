@@ -2,9 +2,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vue-tsc && vite build",
-    "preview": "vite preview"
+    "dev": "vite --configLoader native",
+    "build": "vue-tsc && vite build --configLoader native",
+    "preview": "vite preview --configLoader native"
   },
   "dependencies": {
     "axios": "^1.16.1",

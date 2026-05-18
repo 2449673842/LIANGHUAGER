@@ -6,6 +6,7 @@ from app.routers.health import router as health_router
 from app.routers.strategies import router as strategies_router
 from app.routers.trading import router as trading_router
 from app.routers.workbench import router as workbench_router
+from app.routers.settings import router as settings_router
 
 app = FastAPI(
     title="Codex 实盘回测",
@@ -26,6 +27,7 @@ app.include_router(market_router)
 app.include_router(strategies_router)
 app.include_router(workbench_router)
 app.include_router(trading_router)
+app.include_router(settings_router)
 
 
 @app.get("/")
